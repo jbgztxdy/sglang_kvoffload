@@ -146,6 +146,49 @@ def build_kv_host_pool(
     mtp_draft_device_pools: tuple[Any, ...] = (),
     pool_label: str = "kv",
 ):
+    from sglang.srt.mem_cache.pool_host import peer_gpu
+
+    if peer_gpu.peer_hicache_enabled():
+        return peer_gpu.build_kv_host_pool_hook(
+            kv_pool=kv_pool,
+            page_size=page_size,
+            use_mla=use_mla,
+            override_kv_cache_dim=override_kv_cache_dim,
+            host_size=host_size,
+            mtp_draft_device_pools=mtp_draft_device_pools,
+            pool_label=pool_label,
+            allocator_type=_get_allocator_type(),
+            default_builder=lambda host_size: _build_default_kv_host_pool(
+                kv_pool=kv_pool,
+                page_size=page_size,
+                use_mla=use_mla,
+                override_kv_cache_dim=override_kv_cache_dim,
+                host_size=host_size,
+                mtp_draft_device_pools=mtp_draft_device_pools,
+                pool_label=pool_label,
+            ),
+        )
+    return _build_default_kv_host_pool(
+        kv_pool=kv_pool,
+        page_size=page_size,
+        use_mla=use_mla,
+        override_kv_cache_dim=override_kv_cache_dim,
+        host_size=host_size,
+        mtp_draft_device_pools=mtp_draft_device_pools,
+        pool_label=pool_label,
+    )
+
+
+def _build_default_kv_host_pool(
+    *,
+    kv_pool: Any,
+    page_size: int,
+    use_mla: bool,
+    override_kv_cache_dim: Optional[int],
+    host_size: Optional[float],
+    mtp_draft_device_pools: tuple[Any, ...],
+    pool_label: str,
+):
     kv_host_pool_cls = (
         MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(kv_pool)
     )
@@ -1777,6 +1820,7 @@ class _DsaStrategy(StackStrategy):
         enable_storage_metrics=False,
     ):
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+        from sglang.srt.mem_cache.pool_host.peer_gpu import build_dsa_indexer_host_pool
 
         full_kv_pool = kvcache
         use_mla = isinstance(kvcache, MLATokenToKVPool)
@@ -1790,11 +1834,11 @@ class _DsaStrategy(StackStrategy):
             storage_backend=storage_backend,
             use_mla=use_mla,
             override_kv_cache_dim=full_kv_pool.kv_cache_dim,
-            sidecar_host_pool_factory=lambda kv_host_pool: DSAIndexerPoolHost(
+            sidecar_host_pool_factory=lambda kv_host_pool: build_dsa_indexer_host_pool(
                 full_kv_pool,
                 kv_host_pool,
                 get_memory().hicache_mem_layout,
-                allocator_type=_get_allocator_type(),
+                _get_allocator_type(),
             ),
             prefetch_threshold=prefetch_threshold,
             model_name=model_name,
