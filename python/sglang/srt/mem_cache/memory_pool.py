@@ -4436,7 +4436,11 @@ class MLATokenToKVPool(KVCache):
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.get_key_buffer_nowait(layer_id)
 
+    def get_key_buffer_nowait(self, layer_id: int):
+        """Key buffer without waiting for this layer's HiCache load-back; the
+        caller must only read slots that are not being loaded, or wait itself."""
         if self.store_dtype != self.dtype:
             return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
 

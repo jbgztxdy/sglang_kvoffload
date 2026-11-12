@@ -56,10 +56,15 @@ class IndexKeyCache:
             index_k[tgt_loc_flat] = index_k[src_loc_flat]
 
     def get_local_buffer(self, layer_id: int) -> torch.Tensor:
-        if self.pool.layer_transfer_counter is not None:
-            self.pool.layer_transfer_counter.wait_until(
-                layer_id - self.pool.start_layer
-            )
+        counter = self.pool.layer_transfer_counter
+        if counter is not None:
+            from sglang.srt.mem_cache.pool_host import peer_gpu
+
+            if peer_gpu.split_attention_enabled():
+                # Index-K is loaded ahead of the main KV with its own events.
+                counter.wait_index_until(layer_id - self.pool.start_layer)
+            else:
+                counter.wait_until(layer_id - self.pool.start_layer)
         return self.buffer[layer_id - self.pool.start_layer]
 
     def get_buffer(self, layer_id: int) -> torch.Tensor:

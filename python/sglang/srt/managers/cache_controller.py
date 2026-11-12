@@ -55,14 +55,24 @@ class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
         self.load_events = [device_module.Event() for _ in range(num_layers)]
+        # Peer-GPU split attention: per-layer "index-K loaded" events, recorded
+        # before the (larger) main KV loads so the indexer need not wait for them.
+        self.index_events = [device_module.Event() for _ in range(num_layers)]
         self.start_event = device_module.Event()  # start event on controller stream
 
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
         self.load_events[layer_index].record()
 
+    def complete_index(self, layer_index: int):
+        assert 0 <= layer_index < self._num_layers
+        self.index_events[layer_index].record()
+
     def wait(self, layer_index: int):
         device_module.current_stream().wait_event(self.load_events[layer_index])
+
+    def wait_index(self, layer_index: int):
+        device_module.current_stream().wait_event(self.index_events[layer_index])
 
     @property
     def finish_event(self):
@@ -71,12 +81,43 @@ class LayerLoadingEvent:
 
 class LayerDoneCounter:
     def __init__(self, num_layers: int):
+        from sglang.srt.mem_cache.pool_host import peer_gpu
+
         self.num_layers = num_layers
         # extra producer and consumer counters for overlap mode
         self.num_counters = 3
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
+        # Peer-GPU split attention: per-producer device mask of KV slots being
+        # loaded by that producer (the "remote" part of the batch's prefix).
+        self.remote_masks: list = [None] * self.num_counters
+        self.stall_profiler = peer_gpu.StallProfiler.maybe_create()
+
+    def set_remote_slots(self, producer_index: int, device_indices, num_slots: int):
+        """Mark the slots loaded by ``producer_index``; runs on the current (load) stream."""
+        mask = self.remote_masks[producer_index]
+        if mask is None or mask.numel() < num_slots:
+            mask = torch.zeros(num_slots, dtype=torch.uint8, device=device_indices.device)
+            self.remote_masks[producer_index] = mask
+        else:
+            mask.zero_()
+        mask[device_indices.long()] = 1
+
+    def consumer_remote_mask(self):
+        if self.consumer_index < 0:
+            return None
+        return self.remote_masks[self.consumer_index]
+
+    def wait_index_until(self, threshold: int):
+        if self.consumer_index < 0:
+            return
+        event = self.events[self.consumer_index]
+        if self.stall_profiler is not None:
+            with self.stall_profiler.measure("index"):
+                event.wait_index(threshold)
+        else:
+            event.wait_index(threshold)
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
@@ -91,7 +132,11 @@ class LayerDoneCounter:
     def wait_until(self, threshold: int):
         if self.consumer_index < 0:
             return
-        self.events[self.consumer_index].wait(threshold)
+        if self.stall_profiler is not None:
+            with self.stall_profiler.measure("kv"):
+                self.events[self.consumer_index].wait(threshold)
+        else:
+            self.events[self.consumer_index].wait(threshold)
 
     def reset(self):
         self.producer_index = -1
@@ -958,11 +1003,27 @@ class HiCacheController:
                 self.load_fence_stream
             )
 
+        transfers = self._l2_load_transfers(host_indices, device_indices, pool_transfers)
+        split_kwargs = {}
+        from sglang.srt.mem_cache.pool_host import peer_gpu
+
+        if peer_gpu.split_attention_enabled():
+            # Load all index-K first (tiny, local HBM) with its own per-layer
+            # events, then the main KV; mark the loaded slots as "remote".
+            counter = self.layer_done_counter
+            split_kwargs = dict(
+                is_index_transfer=peer_gpu.is_index_transfer,
+                on_index_layer_done=producer_event.complete_index,
+                before_copy=lambda: peer_gpu.mark_remote_slots(
+                    counter, producer_id, transfers
+                ),
+            )
         completion = self.l2_transfer_engine.submit_host_to_device(
-            self._l2_load_transfers(host_indices, device_indices, pool_transfers),
+            transfers,
             start_event=producer_event.start_event,
             on_layer_done=producer_event.complete,
             layer_num=self.layer_num,
+            **split_kwargs,
         )
 
         self.ack_load_queue.append(

@@ -23,7 +23,19 @@ Env:
   PEER_GPU_HICACHE_RANK=0             attention-DP rank that owns the peer tier
   PEER_GPU_HICACHE_IDLE_HOST_GB=0.2   CPU host tier size on the other ranks
                                       (they get no requests; keep it tiny)
+  PEER_GPU_HICACHE_IDLE_KV_TOKENS=65536  device KV pool cap on the other ranks,
+                                      freeing their HBM for the peer tier
   PEER_GPU_HICACHE_BLOCK_QUOTA=<int>  copy-kernel block quota (default: stock)
+  PEER_GPU_HICACHE_ELIDE_INDEX_K=1    keep DSA index-K elision under HiCache: top-k
+                                      sharing layers store no index-K (device or tier)
+  PEER_GPU_HICACHE_SPLIT_ATTN=1       intra-layer overlap: per layer, index-K is loaded
+                                      first; sparse attention runs over the local
+                                      top-k entries while that layer's remote KV is
+                                      still loading, then over the remote entries,
+                                      and the two partial results are LSE-merged
+  PEER_GPU_HICACHE_SPLIT_VERIFY=<n>   debug: compare the first n split calls with
+                                      unsplit attention and log the max difference
+  PEER_GPU_HICACHE_STALL_PROFILE=1    log GPU time the forward stream waits on loads
 """
 
 from __future__ import annotations
@@ -51,6 +63,7 @@ from sglang.srt.mem_cache.pool_host.common import (
 )
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla, transfer_kv_per_layer_mla
 
 logger = logging.getLogger(__name__)
 
@@ -69,9 +82,124 @@ def idle_rank_host_gb() -> float:
     return float(os.environ.get("PEER_GPU_HICACHE_IDLE_HOST_GB", "0.2"))
 
 
+def elide_index_k_enabled() -> bool:
+    """Keep DSA index-K elision (stock sglang turns it off under HiCache)."""
+    return peer_hicache_enabled() and os.environ.get("PEER_GPU_HICACHE_ELIDE_INDEX_K", "0") == "1"
+
+
+def idle_rank_kv_tokens() -> int:
+    return int(os.environ.get("PEER_GPU_HICACHE_IDLE_KV_TOKENS", "65536"))
+
+
 def _block_quota() -> Optional[int]:
     value = os.environ.get("PEER_GPU_HICACHE_BLOCK_QUOTA")
     return int(value) if value else None
+
+
+# ---------------------------------------------------------------------------
+# Split attention (intra-layer overlap of remote KV load with local attention)
+# ---------------------------------------------------------------------------
+
+
+def split_attention_enabled() -> bool:
+    return peer_hicache_enabled() and os.environ.get("PEER_GPU_HICACHE_SPLIT_ATTN", "0") == "1"
+
+
+def split_verify_budget() -> int:
+    """Number of split-attention calls to check against unsplit attention (debug)."""
+    return int(os.environ.get("PEER_GPU_HICACHE_SPLIT_VERIFY", "0"))
+
+
+def is_index_transfer(transfer) -> bool:
+    return isinstance(transfer.host_pool, DSAIndexerPoolHost)
+
+
+def mark_remote_slots(counter, producer_index: int, transfers) -> None:
+    """Record which device KV slots this load fills; runs on the load stream."""
+    kv = [t for t in transfers if isinstance(t.host_pool, PeerGPUMLAHostPool)]
+    if not kv:
+        return
+    device_pool = kv[0].device_pool
+    num_slots = device_pool.kv_buffer[0].shape[0]
+    indices = torch.cat([t.device_indices for t in kv]) if len(kv) > 1 else kv[0].device_indices
+    counter.set_remote_slots(producer_index, indices, num_slots)
+
+
+class StallProfiler:
+    """Measures how long the forward stream waits on HiCache load-back events.
+
+    For each wait it records a timing event before and after ``wait_event`` on
+    the current stream; the gap is GPU time the stream sat idle for the load.
+    Enabled with PEER_GPU_HICACHE_STALL_PROFILE=1; cumulative totals are logged
+    every PEER_GPU_HICACHE_STALL_LOG_EVERY resolved waits (default 200) and at
+    least every PEER_GPU_HICACHE_STALL_LOG_SECONDS (default 60) while waits occur.
+    """
+
+    def __init__(self):
+        import time
+
+        self._time = time.monotonic
+        self.pending = []
+        self.total_ms = {"kv": 0.0, "index": 0.0}
+        self.count = {"kv": 0, "index": 0}
+        self.resolved = 0
+        self.log_every = int(os.environ.get("PEER_GPU_HICACHE_STALL_LOG_EVERY", "200"))
+        self.log_seconds = float(os.environ.get("PEER_GPU_HICACHE_STALL_LOG_SECONDS", "60"))
+        self._next_log = self.log_every
+        self._last_log_time = self._time()
+
+    @classmethod
+    def maybe_create(cls):
+        if os.environ.get("PEER_GPU_HICACHE_STALL_PROFILE", "0") != "1":
+            return None
+        if not torch.cuda.is_available():
+            return None
+        return cls()
+
+    def measure(self, kind: str):
+        profiler = self
+
+        class _Ctx:
+            def __enter__(self_inner):
+                if torch.cuda.is_current_stream_capturing():
+                    self_inner.a = None
+                    return
+                self_inner.a = torch.cuda.Event(enable_timing=True)
+                self_inner.a.record()
+
+            def __exit__(self_inner, *exc):
+                if self_inner.a is None:
+                    return False
+                b = torch.cuda.Event(enable_timing=True)
+                b.record()
+                profiler.pending.append((kind, self_inner.a, b))
+                if len(profiler.pending) >= 64:
+                    profiler._resolve()
+                return False
+
+        return _Ctx()
+
+    def _resolve(self):
+        keep = []
+        for kind, a, b in self.pending:
+            if b.query():
+                self.total_ms[kind] += a.elapsed_time(b)
+                self.count[kind] += 1
+                self.resolved += 1
+            else:
+                keep.append((kind, a, b))
+        self.pending = keep
+        now = self._time()
+        if self.resolved >= self._next_log or now - self._last_log_time >= self.log_seconds:
+            self._next_log = self.resolved + self.log_every
+            self._last_log_time = now
+            logger.info(
+                "Peer-GPU HiCache stall: kv %.1f ms over %d waits, index %.1f ms over %d waits",
+                self.total_ms["kv"],
+                self.count["kv"],
+                self.total_ms["index"],
+                self.count["index"],
+            )
 
 
 def _enable_peer_access(local: int, peers: list[int]) -> None:
@@ -170,7 +298,10 @@ class PeerGPUMLAHostPool(MLATokenToKVPoolHost):
         self.block_quota = _block_quota()
 
     def init_kv_buffer(self) -> list[torch.Tensor]:
+        # The device pool's device is usually bare "cuda" (current device).
         local = torch.device(self.device_pool.device).index
+        if local is None:
+            local = torch.cuda.current_device()
         peers = [i for i in range(torch.cuda.device_count()) if i != local]
         if not peers:
             raise RuntimeError("Peer-GPU HiCache: no peer GPU visible to this process")
@@ -254,7 +385,12 @@ class PeerGPUMLAHostPool(MLATokenToKVPoolHost):
 
 
 class LocalDeviceIndexerPoolHost(DSAIndexerPoolHost):
-    """DSA indexer "host" pool kept in the owner rank's own HBM (layer_first)."""
+    """DSA indexer "host" pool kept in the rank's own HBM (layer_first, kernel).
+
+    Supports DSA index-K elision: layers that reuse the previous layer's top-k
+    have a 0-page device index-K buffer (see IndexKeyCache), so they get no host
+    buffer and are skipped in every transfer.
+    """
 
     def __init__(self, device_pool, anchor_host, layout: str, allocator_type: str = "default"):
         assert layout == "layer_first", "Peer-GPU HiCache needs --hicache-mem-layout layer_first"
@@ -267,24 +403,76 @@ class LocalDeviceIndexerPoolHost(DSAIndexerPoolHost):
         self.packed_device_index_buffers = [
             b for p in device_pools for b in p.index_k_with_scale_buffer
         ]
+        assert len(self.packed_device_index_buffers) == self.layer_num
+        # Layers whose device index-K was elided (0 pages) carry nothing to move.
+        self.active_layers = [
+            i for i, b in enumerate(self.packed_device_index_buffers) if b.shape[0] > 0
+        ]
+        self.index_k_data_refs = [
+            torch.empty(
+                (self.indexer_page_num if i in self.active_layers else 0, self.indexer_page_stride_size),
+                dtype=self.indexer_dtype,
+                device=self.device_pool.device,
+            )
+            for i in range(self.layer_num)
+        ]
+        # Kept for code that reads it; per-layer buffers live in index_k_data_refs.
+        self.index_k_with_scale_buffer = self.index_k_data_refs
         self.index_k_device_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.packed_device_index_buffers],
+            [self.packed_device_index_buffers[i].data_ptr() for i in self.active_layers],
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
-        self.index_k_with_scale_buffer = torch.empty(
-            (self.layer_num, self.indexer_page_num, self.indexer_page_stride_size),
-            dtype=self.indexer_dtype,
-            device=self.device_pool.device,
-        )
-        self.index_k_data_refs = [self.index_k_with_scale_buffer[i] for i in range(self.layer_num)]
         self.index_k_data_ptrs = make_kernel_ptr_table(
-            self.index_k_data_refs, self.device_pool.device, host_memory_registered=False
+            [self.index_k_data_refs[i] for i in self.active_layers],
+            self.device_pool.device,
+            host_memory_registered=False,
         )
         logger.info(
-            "Peer-GPU HiCache: DSA indexer tier %.2f GB on local %s",
-            self.index_k_with_scale_buffer.nbytes / 1e9,
+            "Peer-GPU HiCache: DSA indexer tier %.2f GB on local %s (%d/%d layers hold index-K)",
+            sum(t.nbytes for t in self.index_k_data_refs) / 1e9,
             self.device_pool.device,
+            len(self.active_layers),
+            self.layer_num,
+        )
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend, *, is_draft=False
+    ):
+        assert io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
+        if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
+            return
+        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
+        device_layer_id = 0 if is_draft else layer_id
+        dst = device_pool.index_k_with_scale_buffer[device_layer_id]
+        if dst.shape[0] == 0:
+            return
+        host_page_indices, device_page_indices = self._get_indexer_page_indices(
+            host_indices, device_indices
+        )
+        transfer_kv_per_layer_mla(
+            src=self.index_k_data_refs[host_layer_id],
+            dst=dst,
+            src_indices=host_page_indices,
+            dst_indices=device_page_indices,
+            item_size=self.indexer_page_stride_size,
+        )
+
+    def backup_from_device_all_layer(self, device_pool, host_indices, device_indices, io_backend):
+        assert io_backend == "kernel" and self.indexer_page_stride_size % 8 == 0
+        assert not self._is_device_layer_sharded(device_pool)
+        if not self.active_layers:
+            return
+        host_page_indices, device_page_indices = self._get_indexer_page_indices(
+            host_indices, device_indices
+        )
+        transfer_kv_all_layer_mla(
+            src_layers=self.index_k_device_ptrs,
+            dst_layers=self.index_k_data_ptrs,
+            src_indices=device_page_indices,
+            dst_indices=host_page_indices,
+            item_size=self.indexer_page_stride_size,
+            num_layers=len(self.active_layers),
         )
 
     def destroy(self) -> None:
@@ -333,7 +521,11 @@ def build_kv_host_pool_hook(
 
 
 def build_dsa_indexer_host_pool(kv_pool, kv_host_pool, layout, allocator_type):
-    """Indexer sidecar: local HBM on the owner rank, stock CPU pool elsewhere."""
-    if peer_hicache_enabled() and is_peer_owner_rank():
+    """Indexer sidecar: local HBM on the owner rank, stock CPU pool elsewhere.
+
+    With index-K elision on, every rank uses the elision-aware local pool (the
+    stock pool would copy into the elided 0-page device buffers).
+    """
+    if peer_hicache_enabled() and (is_peer_owner_rank() or elide_index_k_enabled()):
         return LocalDeviceIndexerPoolHost(kv_pool, kv_host_pool, layout, allocator_type)
     return DSAIndexerPoolHost(kv_pool, kv_host_pool, layout, allocator_type=allocator_type)

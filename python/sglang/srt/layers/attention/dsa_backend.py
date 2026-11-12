@@ -69,6 +69,7 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
     KPoolExtendPlan,
     KPoolWritePlan,
 )
+from sglang.srt.layers.attention.dsa.host_batch import HostBatchMLADecode
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_interleave,
     compute_dsa_seqlens,
@@ -283,6 +284,7 @@ def _cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
 
 
 _DSA_IMPL_T: TypeAlias = Literal[
+    "flashinfer_host_batch",
     "flashmla_sparse",
     "flashmla_sparse_q8",
     "flashmla_kv",
@@ -293,6 +295,15 @@ _DSA_IMPL_T: TypeAlias = Literal[
     "trtllm",
     "intel_xpu",
 ]
+
+
+def _host_page_start(pool, fallback: int) -> int:
+    """Tier boundary of the KV pool, one wrapper level deep if needed."""
+    for candidate in (pool, getattr(pool, "full_kv_pool", None)):
+        value = getattr(candidate, "host_page_start", None)
+        if value is not None:
+            return int(value)
+    return int(fallback)
 
 
 class DeepseekSparseAttnBackend(
@@ -355,6 +366,12 @@ class DeepseekSparseAttnBackend(
         self.supports_mha_one_shot: bool = True
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
+        # Fused host/peer-KV decode: dedup + LRU + remote fetch + attention in one launch.
+        self.host_batch_decode = (
+            HostBatchMLADecode()
+            if self.dsa_decode_impl == "flashinfer_host_batch"
+            else None
+        )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
@@ -1937,7 +1954,13 @@ class DeepseekSparseAttnBackend(
             )
 
         # Do absorbed multi-latent attention (MLA path)
-        kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        peer_split = self._peer_split_context(dsa_impl, forward_batch, attn_sink)
+        if peer_split is not None:
+            # Remote slots of this layer may still be loading; only the split
+            # path below reads them, after waiting for the load.
+            kv_cache = self.token_to_kv_pool.get_key_buffer_nowait(layer.layer_id)
+        else:
+            kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -2097,6 +2120,15 @@ class DeepseekSparseAttnBackend(
 
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            if peer_split is not None:
+                return self._forward_flashmla_sparse_peer_split(
+                    q_all=q_all,
+                    kv_cache=kv_cache,
+                    page_table_1=page_table_1,
+                    layer=layer,
+                    topk_length=metadata.dsa_cache_seqlens_int32,
+                    peer_split=peer_split,
+                )
             return self._forward_flashmla_sparse(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -2284,6 +2316,29 @@ class DeepseekSparseAttnBackend(
                 topk_length=metadata.dsa_cache_seqlens_int32,
                 attn_sink=attn_sink,
             )
+        elif dsa_impl == "flashinfer_host_batch":
+            if self.host_batch_decode is None:
+                raise RuntimeError(
+                    "dsa_decode_backend=flashinfer_host_batch was not initialised"
+                )
+            if q_rope is None:
+                raise RuntimeError(
+                    "host-batch MLA needs the absorbed q_nope/q_rope split"
+                )
+            return self.host_batch_decode.forward(
+                q_nope=q_nope.contiguous(),
+                q_pe=q_rope.contiguous(),
+                kv_cache=kv_cache,
+                indices=page_table_1,
+                layer_id=layer.layer_id,
+                sm_scale=layer.scaling,
+                # The pool reports its tier boundary; an HBM-only pool has no
+                # attribute, so every page is read in place. Hybrid pools keep
+                # the DSA pool one level down.
+                host_page_start=_host_page_start(
+                    self.token_to_kv_pool, kv_cache.shape[0]
+                ),
+            )
         elif dsa_impl == "flashinfer_sparse_mla":
             if q_all is None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -2415,6 +2470,128 @@ class DeepseekSparseAttnBackend(
             num_splits=self.num_splits,
         )
         return o  # type: ignore
+
+    def _peer_split_context(self, dsa_impl, forward_batch, attn_sink):
+        """(counter, remote_mask) when this extend should split attention into
+        local and remote top-k entries (peer-GPU HiCache), else None."""
+        from sglang.srt.mem_cache.pool_host import peer_gpu
+
+        if not peer_gpu.split_attention_enabled():
+            return None
+        if (
+            dsa_impl != "flashmla_sparse"
+            or self.use_mha
+            or attn_sink is not None
+            or self.hisparse_coordinator is not None
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+            # RAGGED dequantizes the whole paged prefix before attention.
+            or self.get_topk_transform_method(forward_batch.forward_mode)
+            == TopkTransformMethod.RAGGED
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        counter = getattr(self.token_to_kv_pool, "layer_transfer_counter", None)
+        if counter is None:
+            return None
+        remote_mask = counter.consumer_remote_mask()
+        if remote_mask is None:
+            return None
+        return counter, remote_mask
+
+    def _forward_flashmla_sparse_peer_split(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        layer: RadixAttention,
+        topk_length: Optional[torch.Tensor],
+        peer_split,
+    ) -> torch.Tensor:
+        """Sparse attention over local top-k entries while this layer's remote KV
+        loads, then over the remote entries; partial outputs are LSE-merged."""
+        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+
+        from sglang.srt.layers.attention.dsa.peer_split import merge_partial, split_topk
+        from sglang.srt.mem_cache.pool_host import peer_gpu
+
+        counter, remote_mask = peer_split
+        num_tokens, num_heads, head_dim = q_all.shape
+        required_padding = 128 if self.device_sm_major >= 10 else 64
+        if num_heads % required_padding != 0:
+            q_input = q_all.new_zeros((num_tokens, required_padding, head_dim))
+            q_input[:, :num_heads, :] = q_all
+        else:
+            q_input = q_all
+        if topk_length is not None and topk_length.shape[0] != num_tokens:
+            topk_length = None
+
+        local_layer = layer.layer_id - self.token_to_kv_pool.start_layer
+        # The remote mask is written on the load stream before any index-K copy,
+        # so waiting for this layer's index-K also orders the mask read.
+        counter.wait_index_until(local_layer)
+        indices = page_table_1.to(torch.int32).contiguous()
+        local_idx, local_len, remote_idx, remote_len = split_topk(
+            indices, remote_mask, topk_length
+        )
+
+        def attend(idx, length):
+            o, _, lse = flash_mla_sparse_fwd(
+                q=q_input,
+                kv=kv_cache,
+                indices=idx.unsqueeze(1),
+                sm_scale=layer.scaling,
+                d_v=layer.v_head_dim,
+                attn_sink=None,
+                topk_length=length,
+            )
+            return o, lse
+
+        o_local, lse_local = attend(local_idx, local_len)
+        counter.wait_until(local_layer)
+        o_remote, lse_remote = attend(remote_idx, remote_len)
+        o = merge_partial(o_local, lse_local, local_len, o_remote, lse_remote, remote_len)
+
+        budget = getattr(self, "_peer_split_verify_left", None)
+        if budget is None:
+            budget = self._peer_split_verify_left = peer_gpu.split_verify_budget()
+            logger.info("Peer-GPU HiCache: split attention active (verify budget %d)", budget)
+        if budget > 0:
+            self._peer_split_verify_left = budget - 1
+            o_ref, _, _ = flash_mla_sparse_fwd(
+                q=q_input,
+                kv=kv_cache,
+                indices=indices.unsqueeze(1),
+                sm_scale=layer.scaling,
+                d_v=layer.v_head_dim,
+                attn_sink=None,
+                topk_length=topk_length,
+            )
+            # Row chunks keep the float temporaries small (a full 8192-row chunk
+            # would need ~1 GB per float copy).
+            max_diff, sum_diff, max_ref = 0.0, 0.0, 0.0
+            for s in range(0, num_tokens, 512):
+                a, b = o[s : s + 512].float(), o_ref[s : s + 512].float()
+                d = (a - b).abs()
+                max_diff = max(max_diff, float(d.max()))
+                sum_diff += float(d.sum())
+                max_ref = max(max_ref, float(b.abs().max()))
+            del o_ref
+            logger.info(
+                "Peer-GPU split verify layer %d: rows %d, local/remote entries %d/%d, "
+                "max abs diff %.3e, mean abs diff %.3e, max |ref| %.3e",
+                layer.layer_id,
+                num_tokens,
+                int(local_len.sum()),
+                int(remote_len.sum()),
+                max_diff,
+                sum_diff / max(o.numel(), 1),
+                max_ref,
+            )
+
+        if q_input is not q_all:
+            o = o[:, :num_heads, :]
+        return o
 
     def _forward_flashmla_sparse(
         self,

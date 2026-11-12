@@ -78,6 +78,9 @@ class L2TransferEngine:
         layer_num: int,
         start_event=None,
         on_layer_done=None,
+        is_index_transfer=None,
+        on_index_layer_done=None,
+        before_copy=None,
     ) -> TransferCompletion:
         start_event = self._start_event(start_event)
         ack_start, ack_finish, timing_enabled = make_timing_event_pair()
@@ -85,6 +88,35 @@ class L2TransferEngine:
         with device_module.stream(self.host_to_device_stream):
             start_event.wait(self.host_to_device_stream)
             ack_start.record()
+            if before_copy is not None:
+                before_copy()
+            if is_index_transfer is not None:
+                # Peer-GPU split attention: all layers' index-K first, each layer
+                # signalled via on_index_layer_done; the main KV follows below.
+                index_transfers = [t for t in transfers if is_index_transfer(t)]
+                transfers = [t for t in transfers if not is_index_transfer(t)]
+                for layer_id in range(layer_num):
+                    for transfer in index_transfers:
+                        local_layer_id = (
+                            transfer.layer_mapper(layer_id)
+                            if transfer.layer_mapper is not None
+                            else layer_id
+                        )
+                        if local_layer_id is None or (
+                            transfer.layer_mapper is None
+                            and layer_id >= transfer.host_pool.layer_num
+                        ):
+                            continue
+                        transfer.host_pool.load_to_device_per_layer(
+                            transfer.device_pool,
+                            transfer.host_indices,
+                            transfer.device_indices,
+                            local_layer_id,
+                            self.io_backend,
+                            is_draft=transfer.is_draft,
+                        )
+                    on_index_layer_done(layer_id)
+                self._record_stream(index_transfers, self.host_to_device_stream)
             for layer_id in range(layer_num):
                 for transfer in transfers:
                     local_layer_id = (

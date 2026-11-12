@@ -58,6 +58,10 @@ from sglang.srt.mem_cache.allocator.unified_mamba import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+from sglang.srt.mem_cache.host_batch_pool import (
+    HostBatchDSATokenToKVPool,
+    host_kv_enabled,
+)
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,
@@ -103,11 +107,14 @@ logger = logging.getLogger(__name__)
 
 
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
+    from sglang.srt.mem_cache.pool_host import peer_gpu
+
     memory_config = get_memory()
     return (
         not memory_config.enable_hisparse
         and not is_draft_worker
-        and not memory_config.enable_hierarchical_cache
+        # Peer-GPU HiCache's indexer tier is elision-aware; stock HiCache is not.
+        and (not memory_config.enable_hierarchical_cache or peer_gpu.elide_index_k_enabled())
         and not memory_config.enable_unified_cache_external_linker
         and get_disagg().disaggregation_mode == "null"
     )
@@ -1630,6 +1637,13 @@ class KVCacheConfigurator:
             pool_kwargs["host_to_device_ratio"] = (
                 parse_hisparse_config().host_to_device_ratio
             )
+        elif (
+            get_exec().kernel.dsa_decode_backend == "flashinfer_host_batch"
+            and host_kv_enabled()
+        ):
+            # Fused host-batch decode: KV lives in pinned host DRAM and the
+            # kernel's own cache slots are the device tier.
+            PoolCls = HostBatchDSATokenToKVPool
         elif dsa_cp_layer_shard_rank is not None:
             # DSA cache layer split: shard KV/indexer layers across CP ranks.
             from sglang.srt.mem_cache.dsa_cache_layer_split import (
@@ -2277,6 +2291,18 @@ class KVCacheConfigurator:
                     f"{token_capacity}. Use the profiled value instead."
                 )
             token_capacity = min(token_capacity, user_limit)
+
+        # Peer-GPU HiCache experiment: ranks that serve no attention keep a tiny
+        # KV pool so their HBM is free for the owner rank's peer tier.
+        from sglang.srt.mem_cache.pool_host import peer_gpu
+
+        if peer_gpu.peer_hicache_enabled() and not peer_gpu.is_peer_owner_rank():
+            idle_cap = peer_gpu.idle_rank_kv_tokens()
+            if idle_cap < token_capacity:
+                logging.warning(
+                    f"Peer-GPU HiCache: capping idle rank KV pool {token_capacity} -> {idle_cap} tokens"
+                )
+                token_capacity = idle_cap
 
         # Sync across PP ranks (each may have different layer counts)
         if get_parallel().pp_size > 1:
