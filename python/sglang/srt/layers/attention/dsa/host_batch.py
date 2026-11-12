@@ -63,10 +63,12 @@ class HostBatchMLADecode:
         self.fetch_ctas = _env_int("SGLANG_HOST_BATCH_FETCH_CTAS", 24)
         self.cache_slots = _env_int("SGLANG_HOST_BATCH_CACHE_SLOTS", 64)
         self.item_entries = _env_int("SGLANG_HOST_BATCH_ITEM_ENTRIES", 64)
+        # Prefill stages a chunk's unique pages; one whole context is the ceiling.
+        self.staging_rows = _env_int("SGLANG_HOST_BATCH_STAGING_ROWS", 1 << 16)
         self._workspace_bytes = workspace_bytes
         self._workspace: Optional[torch.Tensor] = None
-        # (layer_id, rows, topk, sm_scale) -> (wrapper, index buffer)
-        self._entries: Dict[Tuple[int, int, int, float], Tuple[object, torch.Tensor]] = {}
+        # (layer_id, rows, topk, sm_scale, mode) -> (wrapper, index buffer)
+        self._entries: Dict[Tuple[int, int, int, float, str], Tuple[object, torch.Tensor]] = {}
 
     def _ws(self, device: torch.device) -> torch.Tensor:
         if self._workspace is None or self._workspace.device != device:
@@ -82,6 +84,7 @@ class HostBatchMLADecode:
         topk: int,
         sm_scale: float,
         device: torch.device,
+        mode: str,
     ) -> Tuple[object, torch.Tensor]:
         _ensure_source_jit_paths()
         from flashinfer.mla import BatchMLAPagedAttentionWrapper
@@ -106,17 +109,23 @@ class HostBatchMLADecode:
         wrapper.host_item_entries = self.item_entries
         wrapper.host_split = False
         wrapper.host_stage = True
-        wrapper.host_staging_rows = rows * topk
-        wrapper.set_host_cache(
-            torch.arange(rows + 1, dtype=torch.int32), self.cache_slots
-        )
+        if mode == "prefill":
+            # One pass over a chunk: staging holds the chunk's unique pages and
+            # overflow is read in place, so no cross-step LRU state is needed.
+            wrapper.host_staging_rows = self.staging_rows
+        else:
+            wrapper.host_staging_rows = rows * topk
+            wrapper.set_host_cache(
+                torch.arange(rows + 1, dtype=torch.int32), self.cache_slots
+            )
         logger.info(
-            "host-batch MLA: layer %d rows %d topk %d, fetch_ctas %d, cache slots %d",
+            "host-batch MLA: layer %d rows %d topk %d mode %s, fetch_ctas %d, slots %d",
             layer_id,
             rows,
             topk,
+            mode,
             self.fetch_ctas,
-            self.cache_slots,
+            self.cache_slots if mode != "prefill" else 0,
         )
         return wrapper, index_buf
 
@@ -130,6 +139,7 @@ class HostBatchMLADecode:
         sm_scale: float,
         host_page_start: int,
         out: Optional[torch.Tensor] = None,
+        mode: str = "decode",
     ) -> torch.Tensor:
         """q_nope [rows, heads, 512], q_pe [rows, heads, 64], kv_cache [pages, 1, 576]."""
         rows, heads = q_nope.shape[0], q_nope.shape[1]
@@ -142,10 +152,10 @@ class HostBatchMLADecode:
                 f"({_KV_LORA_RANK} nope + {_QK_ROPE_DIM} rope), got "
                 f"{tuple(q_nope.shape)} / {tuple(q_pe.shape)}"
             )
-        key = (layer_id, rows, topk, round(float(sm_scale), 8))
+        key = (layer_id, rows, topk, round(float(sm_scale), 8), mode)
         entry = self._entries.get(key)
         if entry is None:
-            entry = self._build(layer_id, rows, topk, sm_scale, q_nope.device)
+            entry = self._build(layer_id, rows, topk, sm_scale, q_nope.device, mode)
             self._entries[key] = entry
         wrapper, index_buf = entry
 

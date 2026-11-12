@@ -369,7 +369,8 @@ class DeepseekSparseAttnBackend(
         # Fused host/peer-KV decode: dedup + LRU + remote fetch + attention in one launch.
         self.host_batch_decode = (
             HostBatchMLADecode()
-            if self.dsa_decode_impl == "flashinfer_host_batch"
+            if "flashinfer_host_batch"
+            in (self.dsa_decode_impl, self.dsa_prefill_impl)
             else None
         )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
@@ -2022,6 +2023,29 @@ class DeepseekSparseAttnBackend(
                 page_table_1
             ).to(torch.int32)
 
+        if dsa_impl == "flashinfer_host_batch":
+            if self.host_batch_decode is None:
+                raise RuntimeError(
+                    "dsa_prefill_backend=flashinfer_host_batch was not initialised"
+                )
+            if q_rope is None:
+                raise RuntimeError(
+                    "host-batch MLA needs the absorbed q_nope/q_rope split"
+                )
+            # A prefill chunk is just many rows: the kernel dedups their pages
+            # inside one launch, so the host tier is read once per unique page.
+            return self.host_batch_decode.forward(
+                q_nope=q_nope.contiguous(),
+                q_pe=q_rope.contiguous(),
+                kv_cache=kv_cache,
+                indices=page_table_1,
+                layer_id=layer.layer_id,
+                sm_scale=layer.scaling,
+                host_page_start=_host_page_start(
+                    self.token_to_kv_pool, kv_cache.shape[0]
+                ),
+                mode="prefill",
+            )
         if dsa_impl == "tilelang":
             if q_rope is not None:
                 # Cat-skip, as in forward_decode: q_rope=None means the caller

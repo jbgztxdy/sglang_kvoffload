@@ -200,6 +200,7 @@ class ExecKernel(msgspec.Struct):
                 "flashmla_kv",
                 "flashmla_auto",
                 "flashinfer_sparse_mla",
+                "flashinfer_host_batch",
                 "fa3",
                 "tilelang",
                 "triton",
