@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -2023,6 +2024,12 @@ class DeepseekSparseAttnBackend(
                 page_table_1
             ).to(torch.int32)
 
+        if dsa_impl == "flashinfer_host_batch":
+            # Route by row count: long prompt chunks keep the tuned prefill kernel,
+            # small multi-token extends (MTP verify) use the fused host-batch kernel.
+            row_limit = int(os.environ.get("SGLANG_HOST_BATCH_PREFILL_MAX_ROWS", "0") or 0)
+            if row_limit and q_nope.shape[0] > row_limit:
+                dsa_impl = "flashmla_sparse"
         if dsa_impl == "flashinfer_host_batch":
             if self.host_batch_decode is None:
                 raise RuntimeError(
